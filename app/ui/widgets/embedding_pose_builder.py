@@ -1,11 +1,14 @@
 """Build a VisoMaster embedding from a small set of aligned pose references."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import cos, radians, sin
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from app.ui.widgets.embedding_face_mesh import fuse_face_texture, quality_flags, render_mesh, usable_mesh
 
 
 POSES = ("Front", "Turn left", "Turn right", "Look up", "Look down")
@@ -19,6 +22,15 @@ class PosePhoto:
     rgb: np.ndarray
     embeddings: dict
     origin: str = ""
+    landmarks: np.ndarray | None = None
+    excluded: bool = False
+    sharpness: float = field(init=False)
+    thumbnail: np.ndarray = field(init=False)
+
+    def __post_init__(self):
+        gray = cv2.cvtColor(self.rgb, cv2.COLOR_RGB2GRAY)
+        self.sharpness = float(cv2.Laplacian(gray[55:178, 55:169], cv2.CV_32F).var())
+        self.thumbnail = cv2.resize(gray, (24, 24), interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
 def reduce_samples(samples, method):
@@ -160,6 +172,9 @@ class CompositePreview(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.image = QtGui.QImage()
+        self.mesh = None
+        self.wireframe = False
+        self.render_key = None
         self.yaw = self.pitch = 0.0
         self.drag_position = None
         self.setMinimumSize(290, 290)
@@ -176,6 +191,22 @@ class CompositePreview(QtWidgets.QWidget):
         if self.image.isNull():
             painter.setPen(self.palette().text().color())
             painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Add a pose photo to preview")
+            return
+        if self.mesh is not None:
+            size = max(1, min(self.width(), self.height(), 480))
+            key = (size, self.yaw, self.pitch, self.wireframe)
+            if key != self.render_key:
+                rgba = np.ascontiguousarray(render_mesh(
+                    *self.mesh, self.yaw, self.pitch, size, self.wireframe
+                ))
+                self.rendered_mesh = QtGui.QImage(
+                    rgba.data, size, size, rgba.strides[0],
+                    QtGui.QImage.Format.Format_RGBA8888,
+                ).copy()
+                self.render_key = key
+            painter.drawImage(
+                (self.width() - size) // 2, (self.height() - size) // 2, self.rendered_mesh
+            )
             return
         painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
         yaw, pitch = radians(self.yaw), radians(self.pitch)
@@ -227,6 +258,12 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         self.slots = {}
         self.gallery_photos = []
         self.combined_embedding = None
+        self.texture_cache_key = None
+        self.texture_cache = None
+        self.load_refresh = QtCore.QTimer(self)
+        self.load_refresh.setSingleShot(True)
+        self.load_refresh.setInterval(180)
+        self.load_refresh.timeout.connect(self.refresh)
 
         layout = QtWidgets.QHBoxLayout(self)
         board = QtWidgets.QGroupBox("Pose photos")
@@ -285,8 +322,15 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         panel_layout = QtWidgets.QVBoxLayout(panel)
         self.preview = CompositePreview()
         panel_layout.addWidget(self.preview, 1)
-        panel_layout.addWidget(QtWidgets.QLabel("Drag to rotate the composite."))
+        self.preview_hint = QtWidgets.QLabel("Drag to rotate the face.")
+        self.preview_hint.setWordWrap(True)
+        panel_layout.addWidget(self.preview_hint)
         controls = QtWidgets.QHBoxLayout()
+        self.preview_mode = QtWidgets.QComboBox()
+        self.preview_mode.setAccessibleName("Face preview mode")
+        self.preview_mode.addItems(["Textured 3D", "Wireframe", "Enhanced composite", "Mean / Median composite"])
+        self.preview_mode.currentTextChanged.connect(self.refresh)
+        controls.addWidget(self.preview_mode)
         self.method = QtWidgets.QComboBox()
         self.method.setAccessibleName("Composite and embedding merge method")
         self.method.addItems(["Mean", "Median"])
@@ -347,6 +391,16 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         preview.setFixedSize(224, 224)
         content.addWidget(preview)
         layout.addLayout(content)
+        review_options = QtWidgets.QHBoxLayout()
+        overlay = QtWidgets.QCheckBox("Show landmarks")
+        overlay.setChecked(True)
+        review_options.addWidget(overlay)
+        exclude = QtWidgets.QCheckBox("Exclude this photo from merge")
+        review_options.addWidget(exclude)
+        layout.addLayout(review_options)
+        quality = QtWidgets.QLabel()
+        quality.setWordWrap(True)
+        layout.addWidget(quality)
         controls = QtWidgets.QHBoxLayout()
         destination = QtWidgets.QComboBox()
         destination.setAccessibleName("Move selected face to pose")
@@ -364,16 +418,47 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             has_selection = bool(entries.selectedItems())
             move.setEnabled(has_selection)
             remove.setEnabled(has_selection)
-            if 0 <= index < len(photos):
-                preview.setPixmap(self.face_icon(photos[index]).pixmap(224, 224))
-            else:
+            photo = photos[index] if 0 <= index < len(photos) else None
+            with QtCore.QSignalBlocker(exclude):
+                exclude.setEnabled(photo is not None and not photo.origin)
+                exclude.setChecked(bool(photo and photo.excluded))
+            if photo is None:
                 preview.clear()
+                quality.clear()
+                return
+            image = image_from_rgb(photo.rgb)
+            if overlay.isChecked() and usable_mesh(photo):
+                with QtGui.QPainter(image) as painter:
+                    painter.setPen(QtGui.QPen(QtGui.QColor(80, 230, 198, 210), 1.5))
+                    painter.drawPoints(QtGui.QPolygonF([
+                        QtCore.QPointF(float(x), float(y)) for x, y in photo.landmarks[:, :2]
+                    ]))
+            preview.setPixmap(QtGui.QPixmap.fromImage(image))
+            if photo.origin:
+                quality.setText(f"{photo.origin} reference for preview only.")
+            else:
+                references = {
+                    candidate for slot in self.photos.values() for candidate in slot
+                }
+                flags = quality_flags(photo, references)
+                quality.setText(" | ".join(flags) if flags else "Alignment and sharpness checks passed.")
+
+        def set_excluded(checked):
+            index = entries.currentRow()
+            if 0 <= index < len(photos) and not photos[index].origin:
+                photos[index].excluded = checked
+                entries.item(index).setText(entry_label(photos[index]))
+                self.refresh()
+
+        def entry_label(photo):
+            name = photo.name or photo.origin
+            return f"{name} (excluded)" if photo.excluded else name
 
         def populate(index=0):
             entries.clear()
             for photo in photos:
                 entries.addItem(QtWidgets.QListWidgetItem(
-                    self.face_icon(photo), photo.name or photo.origin
+                    self.face_icon(photo), entry_label(photo)
                 ))
             entries.setCurrentRow(min(index, len(photos) - 1))
             show_photo()
@@ -392,6 +477,8 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
 
         entries.currentRowChanged.connect(show_photo)
         entries.itemSelectionChanged.connect(show_photo)
+        overlay.toggled.connect(show_photo)
+        exclude.toggled.connect(set_excluded)
         move.clicked.connect(lambda: update_photo(destination.currentText()))
         remove.clicked.connect(lambda: update_photo())
         close.clicked.connect(dialog.accept)
@@ -457,13 +544,22 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.main_window, files_list=files, parent=self,
             max_faces_per_image=0 if folder else 1, align_preview=True,
         )
+        self.pending_landmarks = None
+        self.loader.mesh_ready.connect(self.mesh_loaded)
         self.loader.thumbnail_ready.connect(self.photo_loaded)
         self.loader.finished.connect(self.finish_loading, QtCore.Qt.ConnectionType.QueuedConnection)
         self.loader.start()
 
+    @QtCore.Slot(object)
+    def mesh_loaded(self, points):
+        self.pending_landmarks = points
+
     @QtCore.Slot(str, np.ndarray, object, QtGui.QImage, str)
     def photo_loaded(self, path, _crop, embeddings, image, _face_id):
-        photo = PosePhoto(Path(path).name, aligned_rgb(image), embeddings)
+        photo = PosePhoto(
+            Path(path).name, aligned_rgb(image), embeddings, landmarks=self.pending_landmarks
+        )
+        self.pending_landmarks = None
         if self.pending_pose is None:
             self.gallery_photos.append(photo)
             item = QtWidgets.QListWidgetItem(self.face_icon(photo), "")
@@ -473,13 +569,14 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         else:
             self.loaded_photo_count += 1
             self.add_pose_photos(self.pending_pose, [photo])
-            self.refresh()
+            self.load_refresh.start()
 
     @QtCore.Slot()
     def finish_loading(self):
         if self.loader is None:
             return
         pose = self.pending_pose
+        self.load_refresh.stop()
         self.loader.wait()
         self.loader.deleteLater()
         self.loader = None
@@ -514,7 +611,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         if self.loader is not None:
             return
         for source, target in (("Turn left", "Turn right"), ("Turn right", "Turn left")):
-            real = [photo.rgb for photo in self.photos.get(source, []) if not photo.origin]
+            real = [photo.rgb for photo in self.photos.get(source, []) if not photo.origin and not photo.excluded]
             existing = self.photos.get(target, [])
             if real and all(photo.origin == "Estimated" for photo in existing):
                 rgb = np.rint(reduce_samples(real, self.method.currentText())).astype(np.uint8)
@@ -526,7 +623,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
     def fill_missing(self):
         if self.loader is not None:
             return
-        real = [photo.rgb for slot in self.photos.values() for photo in slot if not photo.origin]
+        real = [photo.rgb for slot in self.photos.values() for photo in slot if not photo.origin and not photo.excluded]
         if len(real) < 2:
             self.status.setText("Add at least two real photos to estimate missing views.")
             return
@@ -542,7 +639,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
                 continue
             samples = [
                 photo.rgb for key in adjacent for photo in self.photos.get(key, [])
-                if not photo.origin
+                if not photo.origin and not photo.excluded
             ]
             rgb = reduce_samples(samples if len(samples) >= 2 else real, "Mean")
             self.photos[pose] = [PosePhoto("", np.rint(rgb).astype(np.uint8), {}, "Estimated")]
@@ -561,13 +658,38 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             slot.setText(f"{pose}\n{detail}" if detail else pose)
             slot.setToolTip("Right-click to review or move individual faces" if photos else "Drop photos here")
             slot.setIcon(icon)
-        photos = list(dict.fromkeys(photo for slot in self.photos.values() for photo in slot))
-        self.preview.image = (
-            image_from_rgb(np.rint(reduce_samples([p.rgb for p in photos], method)))
-            if photos else QtGui.QImage()
-        )
-        self.preview.update()
+        photos = list(dict.fromkeys(
+            photo for slot in self.photos.values() for photo in slot if not photo.excluded
+        ))
         real = [photo for photo in photos if not photo.origin]
+        front = [
+            photo for photo in self.photos.get("Front", []) if not photo.origin and not photo.excluded
+        ]
+        mode = self.preview_mode.currentText()
+        self.preview.mesh = None
+        self.preview.wireframe = mode == "Wireframe"
+        self.preview.render_key = None
+        if real and mode != "Mean / Median composite":
+            key = tuple(real), tuple(front)
+            if key != self.texture_cache_key:
+                self.texture_cache = fuse_face_texture(real, front)
+                self.texture_cache_key = key
+            texture, points, triangles = self.texture_cache
+            self.preview.image = image_from_rgb(texture)
+            if mode in ("Textured 3D", "Wireframe") and points is not None:
+                self.preview.mesh = texture, points, triangles
+                self.preview_hint.setText("Drag to rotate the facial surface.")
+            elif mode in ("Textured 3D", "Wireframe"):
+                self.preview_hint.setText("3D landmarks unavailable. Showing the best available crop.")
+            else:
+                self.preview_hint.setText("Sharp reference anchored with aligned, color-matched detail.")
+        else:
+            self.preview.image = (
+                image_from_rgb(np.rint(reduce_samples([photo.rgb for photo in photos], method)))
+                if photos else QtGui.QImage()
+            )
+            self.preview_hint.setText("Drag to tilt the composite.")
+        self.preview.update()
         self.combined_embedding = None
         message = "Drop photos on a slot or select a slot and choose photos."
         if real:

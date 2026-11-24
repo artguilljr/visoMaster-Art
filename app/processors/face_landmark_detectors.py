@@ -837,31 +837,9 @@ class FaceLandmarkDetectors:
             else:
                 self.active_landmark_models.add("FaceBlendShapes")
 
-        aimg, _, IM = self._prepare_crop(
-            img,
-            bbox,
-            det_kpss,
-            from_points,
-            target_size=256,
-            warp_mode="arcfacemap",
-            scale=1.5,
-        )
-        if aimg is None:
-            return [], [], []
-
-        aimg = torch.div(aimg.to(dtype=torch.float32), 255.0).unsqueeze(0).contiguous()
-
-        net_outs = self._run_onnx_binding(
-            "FaceLandmark478",
-            {"input_12": aimg},
-            ["Identity", "Identity_1", "Identity_2"],
-        )
-        if not net_outs or len(net_outs) < 1:
-            return [], [], []
-        landmarks = net_outs[0].reshape((1, 478, 3))
-
-        if len(landmarks) > 0:
-            landmark = faceutil.trans_points3d(landmarks[0], IM)[:, :2].reshape(-1, 2)
+        points = self.predict_face_mesh(img, bbox, det_kpss, from_points)
+        if points is not None:
+            landmark = points[:, :2].copy()
 
             # This model uses a second network ('FaceBlendShapes') to get scores.
             landmark_for_score = landmark[self.models_processor.LandmarksSubsetIdxs]
@@ -881,6 +859,32 @@ class FaceLandmarkDetectors:
             )
             return landmark_5, landmark, landmark_score
         return [], [], []
+
+    def predict_face_mesh(self, img, bbox, det_kpss, from_points=False):
+        """Return the facial surface with depth in the input image coordinate system."""
+        aimg, _, IM = self._prepare_crop(
+            img,
+            bbox,
+            det_kpss,
+            from_points,
+            target_size=256,
+            warp_mode="arcfacemap",
+            scale=1.5,
+        )
+        if aimg is None:
+            return None
+
+        aimg = torch.div(aimg.to(dtype=torch.float32), 255.0).unsqueeze(0).contiguous()
+
+        net_outs = self._run_onnx_binding(
+            "FaceLandmark478",
+            {"input_12": aimg},
+            ["Identity", "Identity_1", "Identity_2"],
+        )
+        if not net_outs or len(net_outs) < 1:
+            return None
+        return faceutil.trans_points3d(net_outs[0].reshape(478, 3), IM)
+
 
     def _prepare_upright_square_crop(
         self,

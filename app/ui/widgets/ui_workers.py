@@ -352,6 +352,7 @@ class IssueScanWorker(qtc.QThread):
 class InputFacesLoaderWorker(qtc.QThread):
     # Define signals to emit when loading is done or if there are updates - Changed to QImage
     thumbnail_ready = qtc.Signal(str, numpy.ndarray, object, QImage, str)
+    mesh_ready = qtc.Signal(object)
     finished = qtc.Signal()  # Signal to indicate completion
 
     def __init__(
@@ -461,7 +462,7 @@ class InputFacesLoaderWorker(qtc.QThread):
                     )
                     img = img.permute(2, 0, 1)
 
-                    _, kpss_5, _ = self.main_window.function_worker.run_detect(
+                    boxes, kpss_5, _ = self.main_window.function_worker.run_detect(
                         img,
                         str(control.get("DetectorModelSelection", "RetinaFace")),
                         max_num=self.max_faces_per_image,
@@ -486,7 +487,7 @@ class InputFacesLoaderWorker(qtc.QThread):
                     if kpss_5 is None or len(kpss_5) == 0:
                         continue
 
-                    for face_kps in kpss_5:
+                    for face_index, face_kps in enumerate(kpss_5):
                         if face_kps.any():
                             # Calculate embedding ONLY for the selected recognition model
                             selected_recognition_model = str(
@@ -508,10 +509,10 @@ class InputFacesLoaderWorker(qtc.QThread):
                                 continue
 
                             if self.align_preview:
-                                from app.processors.utils.faceutil import warp_face_by_face_landmark_5
+                                from app.processors.utils import faceutil
 
                                 # Use a shared eye/nose/mouth template for the composite.
-                                aligned, _ = warp_face_by_face_landmark_5(
+                                aligned, matrix = faceutil.warp_face_by_face_landmark_5(
                                     img,
                                     face_kps,
                                     image_size=224,
@@ -519,6 +520,16 @@ class InputFacesLoaderWorker(qtc.QThread):
                                     interpolation=InterpolationMode.BILINEAR,
                                 )
                                 cropped_img = aligned.permute(1, 2, 0)
+                                points = None
+                                try:
+                                    detector = self.main_window.function_worker.face_landmark_detectors
+                                    points = detector.predict_face_mesh(
+                                        img, boxes[face_index], face_kps
+                                    )
+                                    if points is not None:
+                                        points = faceutil.trans_points3d(points, matrix)
+                                except Exception:
+                                    traceback.print_exc()
 
                             cropped_img_np = cropped_img.cpu().numpy()
                             # Swap channels from RGB to BGR for pixmap creation
@@ -540,6 +551,8 @@ class InputFacesLoaderWorker(qtc.QThread):
                                 "kps_5": face_kps,
                             }
 
+                            if self.align_preview:
+                                self.mesh_ready.emit(points)
                             self.thumbnail_ready.emit(
                                 image_file_path, face_img, embedding_store, q_image, face_id
                             )
