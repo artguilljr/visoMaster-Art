@@ -298,6 +298,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         for caption, action in (
             ("Choose photos", self.choose_photos),
             ("Clear slot", self.clear_slot),
+            ("Clear All", self.clear_all),
             ("Mirror missing side", self.mirror_side),
             ("Fill missing views", self.fill_missing),
         ):
@@ -417,9 +418,10 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         move = QtWidgets.QPushButton("Move selected to pose")
         flip = QtWidgets.QPushButton("Flip horizontally")
         sharpen = QtWidgets.QPushButton("Sharpen")
+        restore = QtWidgets.QPushButton("Restore Preview")
         remove = QtWidgets.QPushButton("Remove selected")
         close = QtWidgets.QPushButton("Close")
-        for button in (move, flip, sharpen, remove, close):
+        for button in (move, flip, sharpen, restore, remove, close):
             controls.addWidget(button)
         layout.addLayout(controls)
 
@@ -435,6 +437,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             flip.setEnabled(can_process)
             sharpen.setEnabled(can_process)
             photo = photos[index] if 0 <= index < len(photos) else None
+            restore.setEnabled(can_edit and len(entries.selectedItems()) == 1 and photo is not None and not photo.origin)
             with QtCore.QSignalBlocker(exclude):
                 exclude.setEnabled(self.loader is None and photo is not None and not photo.origin)
                 exclude.setChecked(bool(photo and photo.excluded))
@@ -493,8 +496,9 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.refresh()
             populate(indexes[0])
 
-        def process_selected(transform, operation):
-            indexes = sorted(entries.row(item) for item in entries.selectedItems())
+        def process_selected(transform, operation, indexes=None):
+            if indexes is None:
+                indexes = sorted(entries.row(item) for item in entries.selectedItems())
             originals = {
                 f"{index}.png": photos[index] for index in indexes if not photos[index].origin
             }
@@ -523,6 +527,19 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             if accepted:
                 process_selected(lambda rgb: sharpen_crop(rgb, strength), "Sharpened")
 
+        def restore_selected():
+            from app.ui.widgets.embedding_restoration import RestorationPreview
+
+            index = entries.currentRow()
+            if index < 0 or photos[index].origin or self.loader is not None:
+                return
+            if self.media_busy():
+                quality.setText("Pause playback or finish rendering before restoring a photo.")
+                return
+            preview = RestorationPreview(dialog, self.main_window, photos[index].rgb)
+            if preview.exec() == QtWidgets.QDialog.DialogCode.Accepted and preview.result is not None:
+                process_selected(lambda rgb: preview.result, "Restored", [index])
+
         entries.currentRowChanged.connect(show_photo)
         entries.itemSelectionChanged.connect(show_photo)
         overlay.toggled.connect(show_photo)
@@ -530,6 +547,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         move.clicked.connect(lambda: update_photo(destination.currentText()))
         flip.clicked.connect(lambda: process_selected(lambda rgb: rgb[:, ::-1], "Flipped"))
         sharpen.clicked.connect(sharpen_selected)
+        restore.clicked.connect(restore_selected)
         remove.clicked.connect(lambda: update_photo())
         close.clicked.connect(dialog.accept)
         populate()
@@ -557,17 +575,20 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
     def load_photos(self, pose, paths):
         self.start_photo_loader(paths, pose=pose)
 
+    def media_busy(self):
+        video = self.main_window.video_processor
+        return (
+            video.processing or video.is_processing_segments
+            or getattr(self.main_window, "is_batch_processing", False)
+        )
+
     def start_photo_loader(
         self, files, *, pose=None, folder=None, edit_targets=None,
         image_overrides=None, operation=None, on_finished=None
     ):
         if self.loader is not None:
             return
-        if (
-            self.main_window.video_processor.processing
-            or self.main_window.video_processor.is_processing_segments
-            or getattr(self.main_window, "is_batch_processing", False)
-        ):
+        if self.media_busy():
             self.status.setText("Pause playback or finish rendering before loading a pose photo.")
             return
         from app.ui.widgets.ui_workers import InputFacesLoaderWorker
@@ -680,6 +701,20 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         if self.loader is None:
             self.photos.pop(self.selected_pose, None)
             self.refresh()
+
+    def clear_all(self):
+        if self.loader is not None:
+            return
+        self.photos.clear()
+        self.gallery.clear()
+        self.gallery_photos.clear()
+        self.texture_cache_key = None
+        self.texture_cache = None
+        self.slots["Front"].setChecked(True)
+        self.select_pose("Front")
+        self.folder_status.setText("Drag a detected face into a pose slot.")
+        self.preview.reset_view()
+        self.refresh()
 
     def move_photo(self, source, target):
         if self.loader is not None or source == target or not self.photos.get(source):
