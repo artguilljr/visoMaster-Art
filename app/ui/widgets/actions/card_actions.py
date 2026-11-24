@@ -168,6 +168,12 @@ def uncheck_all_merged_embeddings(main_window: "MainWindow"):
         torch.cuda.empty_cache()
 
 
+def note_target_face_observation(target_face, frame):
+    if frame is not None:
+        first, last = getattr(target_face, "observed_frame_range", (frame, frame))
+        target_face.observed_frame_range = min(first, frame), max(last, frame)
+
+
 def find_target_faces(main_window: "MainWindow"):
     from app.ui.widgets.actions import video_control_actions
 
@@ -262,6 +268,11 @@ def find_target_faces(main_window: "MainWindow"):
                 )
                 faces_list.append([face_kps, face_emb, cropped_img, img])
 
+            observed_frame = (
+                video_processor.current_frame_number
+                if video_processor.file_type == "video"
+                else None
+            )
             if faces_list:
                 # Loop through all faces in video frame
                 for face in faces_list:
@@ -280,6 +291,7 @@ def find_target_faces(main_window: "MainWindow"):
                             ),
                             face[1],
                         ) >= float(threshhold):
+                            note_target_face_observation(target_face, observed_frame)
                             found = True
                             break
 
@@ -317,10 +329,13 @@ def find_target_faces(main_window: "MainWindow"):
                             main_window, face_img, embedding_store, q_image, face_id
                         )
 
+                        new_target_face = main_window.target_faces.get(face_id)
+                        if new_target_face is not None:
+                            note_target_face_observation(new_target_face, observed_frame)
+
                         if control.get("KeepInputToggle", False) or control.get(
                             "AutoSwapToggle", False
                         ):
-                            new_target_face = main_window.target_faces.get(face_id)
                             if new_target_face:
                                 # Assign checked Input Faces
                                 for (

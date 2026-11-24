@@ -26,7 +26,7 @@ from app.processors.video_processor import VideoProcessor
 from app.processors.models_processor import ModelsProcessor
 from app.processors.utils import platform_support
 from app.processors.workers.function_worker import FunctionWorker
-from app.ui.widgets import widget_components
+from app.ui.widgets import face_assignment_review, widget_components
 from app.ui.widgets.event_filters import (
     GraphicsViewEventFilter,
     VideoSeekSliderEventFilter,
@@ -464,6 +464,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.clearTargetFacesButton.clicked.connect(
             partial(card_actions.clear_target_faces, self)
         )
+        self.reviewFaceAssignmentsButton = QtWidgets.QPushButton("Review")
+        self.reviewFaceAssignmentsButton.setObjectName("reviewFaceAssignmentsButton")
+        self.reviewFaceAssignmentsButton.setToolTip("Review target faces and their replacements")
+        self.reviewFaceAssignmentsButton.setFlat(True)
+        self.reviewFaceAssignmentsButton.clicked.connect(
+            partial(face_assignment_review.open_review, self)
+        )
+        self.controlButtonsLayout.insertWidget(2, self.reviewFaceAssignmentsButton)
         self.inputFacesSearchBox.textChanged.connect(
             partial(filter_actions.filter_input_faces, self)
         )
@@ -1918,6 +1926,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         buttons = [
             self.findTargetFacesButton,
             self.clearTargetFacesButton,
+            self.reviewFaceAssignmentsButton,
             self.swapfacesButton,
             self.editFacesButton,
         ]
@@ -2025,6 +2034,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         btns = [
             (self.findTargetFacesButton, "Find"),
             (self.clearTargetFacesButton, "Clear"),
+            (self.reviewFaceAssignmentsButton, "Review"),
             (self.swapfacesButton, "Swap"),
             (self.editFacesButton, "Edit"),
         ]
@@ -2053,6 +2063,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         btns = [
             self.findTargetFacesButton,
             self.clearTargetFacesButton,
+            self.reviewFaceAssignmentsButton,
             self.swapfacesButton,
             self.editFacesButton,
         ]
