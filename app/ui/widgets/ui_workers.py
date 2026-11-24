@@ -361,12 +361,15 @@ class InputFacesLoaderWorker(qtc.QThread):
         files_list=None,
         face_ids=None,
         parent=None,
+        *,
+        max_faces_per_image=1,
     ):
         super().__init__(parent)
         self.main_window = main_window
         self.folder_name = folder_name
         self.files_list = files_list or []
         self.face_ids = face_ids or []
+        self.max_faces_per_image = max_faces_per_image
         self._running = True  # Flag to control the running state
 
         # SNAPSHOT : get parameters in main thread before run()
@@ -458,7 +461,7 @@ class InputFacesLoaderWorker(qtc.QThread):
                     _, kpss_5, _ = self.main_window.function_worker.run_detect(
                         img,
                         str(control.get("DetectorModelSelection", "RetinaFace")),
-                        max_num=1,
+                        max_num=self.max_faces_per_image,
                         score=float(control.get("DetectorScoreSlider", 50)) / 100.0,
                         input_size=(512, 512),
                         use_landmark_detection=bool(
@@ -480,50 +483,50 @@ class InputFacesLoaderWorker(qtc.QThread):
                     if kpss_5 is None or len(kpss_5) == 0:
                         continue
 
-                    face_kps = kpss_5[0]
-                    if face_kps.any():
-                        # Calculate embedding ONLY for the selected recognition model
-                        selected_recognition_model = str(
-                            control.get(
-                                "RecognitionModelSelection", "Inswapper128ArcFace"
+                    for face_kps in kpss_5:
+                        if face_kps.any():
+                            # Calculate embedding ONLY for the selected recognition model
+                            selected_recognition_model = str(
+                                control.get(
+                                    "RecognitionModelSelection", "Inswapper128ArcFace"
+                                )
                             )
-                        )
-                        similarity_type = str("Auto")
-                        face_emb, cropped_img = (
-                            self.main_window.function_worker.run_recognize_direct(
-                                img,
-                                face_kps,
-                                similarity_type,
-                                selected_recognition_model,  # Use selected model
+                            similarity_type = str("Auto")
+                            face_emb, cropped_img = (
+                                self.main_window.function_worker.run_recognize_direct(
+                                    img,
+                                    face_kps,
+                                    similarity_type,
+                                    selected_recognition_model,  # Use selected model
+                                )
                             )
-                        )
 
-                        if face_emb is None:  # Check if recognition failed
-                            continue
+                            if face_emb is None:  # Check if recognition failed
+                                continue
 
-                        cropped_img_np = cropped_img.cpu().numpy()
-                        # Swap channels from RGB to BGR for pixmap creation
-                        face_img = numpy.ascontiguousarray(cropped_img_np[..., ::-1])
+                            cropped_img_np = cropped_img.cpu().numpy()
+                            # Swap channels from RGB to BGR for pixmap creation
+                            face_img = numpy.ascontiguousarray(cropped_img_np[..., ::-1])
 
-                        # QIMAGE THREAD-SAFE
-                        height, width, channel = face_img.shape
-                        bytes_per_line = 3 * width
-                        q_image = QImage(
-                            face_img.data,
-                            width,
-                            height,
-                            bytes_per_line,
-                            QImage.Format_BGR888,
-                        ).copy()
+                            # QIMAGE THREAD-SAFE
+                            height, width, channel = face_img.shape
+                            bytes_per_line = 3 * width
+                            q_image = QImage(
+                                face_img.data,
+                                width,
+                                height,
+                                bytes_per_line,
+                                QImage.Format_BGR888,
+                            ).copy()
 
-                        embedding_store: Dict[str, numpy.ndarray] = {
-                            selected_recognition_model: face_emb,
-                            "kps_5": face_kps,
-                        }
+                            embedding_store: Dict[str, numpy.ndarray] = {
+                                selected_recognition_model: face_emb,
+                                "kps_5": face_kps,
+                            }
 
-                        self.thumbnail_ready.emit(
-                            image_file_path, face_img, embedding_store, q_image, face_id
-                        )
+                            self.thumbnail_ready.emit(
+                                image_file_path, face_img, embedding_store, q_image, face_id
+                            )
 
                 except Exception as e:
                     print(
