@@ -366,6 +366,7 @@ class InputFacesLoaderWorker(qtc.QThread):
         *,
         max_faces_per_image=1,
         align_preview=False,
+        image_overrides=None,
     ):
         super().__init__(parent)
         self.main_window = main_window
@@ -374,6 +375,7 @@ class InputFacesLoaderWorker(qtc.QThread):
         self.face_ids = face_ids or []
         self.max_faces_per_image = max_faces_per_image
         self.align_preview = align_preview
+        self.image_overrides = image_overrides or {}
         self._running = True  # Flag to control the running state
 
         # SNAPSHOT : get parameters in main thread before run()
@@ -432,6 +434,8 @@ class InputFacesLoaderWorker(qtc.QThread):
             image_path: str, f_id: str
         ) -> Tuple[str, str, Optional[numpy.ndarray]]:
             """Background CPU task to read and prepare image bytes."""
+            if image_path in self.image_overrides:
+                return image_path, f_id, self.image_overrides[image_path]
             if not misc_helpers.is_image_file(image_path):
                 return image_path, f_id, None
             frame = misc_helpers.read_image_file(image_path)

@@ -33,6 +33,14 @@ class PosePhoto:
         self.thumbnail = cv2.resize(gray, (24, 24), interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
+def sharpen_crop(rgb, strength):
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    detail = gray - cv2.GaussianBlur(gray, (0, 0), 1.15)
+    detail[np.abs(detail) < 3] = 0
+    adjustment = detail[..., None] * (strength / 100)
+    return np.rint(np.clip(rgb + adjustment, 0, 255)).astype(np.uint8)
+
+
 def reduce_samples(samples, method):
     reducer = np.median if method == "Median" else np.mean
     return reducer(np.stack(samples), axis=0)
@@ -407,20 +415,28 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         destination.addItems([candidate for candidate in POSES if candidate != pose])
         controls.addWidget(destination)
         move = QtWidgets.QPushButton("Move selected to pose")
+        flip = QtWidgets.QPushButton("Flip horizontally")
+        sharpen = QtWidgets.QPushButton("Sharpen")
         remove = QtWidgets.QPushButton("Remove selected")
         close = QtWidgets.QPushButton("Close")
-        for button in (move, remove, close):
+        for button in (move, flip, sharpen, remove, close):
             controls.addWidget(button)
         layout.addLayout(controls)
 
         def show_photo():
             index = entries.currentRow()
             has_selection = bool(entries.selectedItems())
-            move.setEnabled(has_selection)
-            remove.setEnabled(has_selection)
+            can_edit = has_selection and self.loader is None
+            move.setEnabled(can_edit)
+            remove.setEnabled(can_edit)
+            can_process = can_edit and any(
+                not photos[entries.row(item)].origin for item in entries.selectedItems()
+            )
+            flip.setEnabled(can_process)
+            sharpen.setEnabled(can_process)
             photo = photos[index] if 0 <= index < len(photos) else None
             with QtCore.QSignalBlocker(exclude):
-                exclude.setEnabled(photo is not None and not photo.origin)
+                exclude.setEnabled(self.loader is None and photo is not None and not photo.origin)
                 exclude.setChecked(bool(photo and photo.excluded))
             if photo is None:
                 preview.clear()
@@ -452,7 +468,9 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
 
         def entry_label(photo):
             name = photo.name or photo.origin
-            return f"{name} (excluded)" if photo.excluded else name
+            if photo.excluded:
+                return f"{name} (excluded)"
+            return name
 
         def populate(index=0):
             entries.clear()
@@ -475,11 +493,43 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.refresh()
             populate(indexes[0])
 
+        def process_selected(transform, operation):
+            indexes = sorted(entries.row(item) for item in entries.selectedItems())
+            originals = {
+                f"{index}.png": photos[index] for index in indexes if not photos[index].origin
+            }
+            if not originals:
+                return
+
+            def show_result():
+                if dialog.isVisible():
+                    populate(indexes[0])
+                    quality.setText(self.status.text())
+
+            overrides = {
+                path: np.ascontiguousarray(transform(photo.rgb)) for path, photo in originals.items()
+            }
+            self.start_photo_loader(
+                list(originals), pose=pose, edit_targets=originals,
+                image_overrides=overrides, operation=operation, on_finished=show_result,
+            )
+            show_photo()
+            quality.setText(self.status.text())
+
+        def sharpen_selected():
+            strength, accepted = QtWidgets.QInputDialog.getInt(
+                dialog, "Sharpen photos", "Strength (%)", 35, 1, 100
+            )
+            if accepted:
+                process_selected(lambda rgb: sharpen_crop(rgb, strength), "Sharpened")
+
         entries.currentRowChanged.connect(show_photo)
         entries.itemSelectionChanged.connect(show_photo)
         overlay.toggled.connect(show_photo)
         exclude.toggled.connect(set_excluded)
         move.clicked.connect(lambda: update_photo(destination.currentText()))
+        flip.clicked.connect(lambda: process_selected(lambda rgb: rgb[:, ::-1], "Flipped"))
+        sharpen.clicked.connect(sharpen_selected)
         remove.clicked.connect(lambda: update_photo())
         close.clicked.connect(dialog.accept)
         populate()
@@ -507,7 +557,10 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
     def load_photos(self, pose, paths):
         self.start_photo_loader(paths, pose=pose)
 
-    def start_photo_loader(self, files, *, pose=None, folder=None):
+    def start_photo_loader(
+        self, files, *, pose=None, folder=None, edit_targets=None,
+        image_overrides=None, operation=None, on_finished=None
+    ):
         if self.loader is not None:
             return
         if (
@@ -534,15 +587,20 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.gallery.clear()
             self.gallery_photos.clear()
             self.folder_status.setText(f"Scanning {len(files)} photos in {Path(folder).name}...")
+        elif edit_targets:
+            self.status.setText("Re-aligning edited faces...")
         else:
             self.status.setText(f"Finding faces in {len(files)} selected photo(s)...")
         self.folder_button.setEnabled(False)
         self.save.setEnabled(False)
         self.loaded_photo_count = 0
         self.pending_pose = pose
+        self.edit_targets = edit_targets
+        self.edit_operation = operation
+        self.on_photo_load_finished = on_finished
         self.loader = PosePhotoLoader(
             self.main_window, files_list=files, parent=self,
-            max_faces_per_image=0 if folder else 1, align_preview=True,
+            max_faces_per_image=0 if folder else 1, align_preview=True, image_overrides=image_overrides,
         )
         self.pending_landmarks = None
         self.loader.mesh_ready.connect(self.mesh_loaded)
@@ -566,6 +624,14 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             item.setToolTip(photo.name)
             item.setData(QtCore.Qt.ItemDataRole.AccessibleTextRole, photo.name)
             self.gallery.addItem(item)
+        elif self.edit_targets:
+            original = self.edit_targets[path]
+            slot = self.photos.get(self.pending_pose, [])
+            if original in slot:
+                photo.name = original.name
+                photo.excluded = original.excluded
+                slot[slot.index(original)] = photo
+                self.loaded_photo_count += 1
         else:
             self.loaded_photo_count += 1
             self.add_pose_photos(self.pending_pose, [photo])
@@ -581,6 +647,20 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         self.loader.deleteLater()
         self.loader = None
         self.folder_button.setEnabled(True)
+        if self.edit_targets:
+            attempted = len(self.edit_targets)
+            self.edit_targets = None
+            callback = self.on_photo_load_finished
+            self.on_photo_load_finished = None
+            self.refresh()
+            count = self.loaded_photo_count
+            message = f"{self.edit_operation} {count} of {attempted} selected photo(s) in {pose}."
+            if count < attempted:
+                message += " Photos that could not be aligned were kept."
+            self.status.setText(message)
+            if callback:
+                callback()
+            return
         if pose is None:
             count = len(self.gallery_photos)
             self.folder_status.setText(
