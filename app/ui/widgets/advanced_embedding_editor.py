@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QGraphicsDropShadowEffect,
     QMenuBar,
+    QTabWidget,
 )
 from PySide6.QtCore import (
     Qt,
@@ -431,9 +432,11 @@ class StacksWidget(QWidget):
 
 
 class EmbeddingGUI(QWidget):
-    def __init__(self):
+    def __init__(self, main_window=None):
         super().__init__()
         self.setWindowTitle("Advanced Embedding Editor")
+        self.main_window = main_window
+        self.current_file_type = "json"
         # MARKER: Initialize with OrderedDict
         self.embedding_data = OrderedDict()
         self.original_embedding_data = OrderedDict()
@@ -533,11 +536,40 @@ class EmbeddingGUI(QWidget):
 
         layout.addWidget(bottom_widget)
 
-        main_layout.addWidget(content_widget)
+        if self.main_window is None:
+            main_layout.addWidget(content_widget)
+        else:
+            from app.ui.widgets.embedding_pose_builder import EmbeddingPoseBuilder
+
+            self.editor_tabs = QTabWidget()
+            self.editor_tabs.addTab(content_widget, "Library")
+            self.editor_tabs.addTab(
+                EmbeddingPoseBuilder(self.main_window, self.add_built_embedding),
+                "Build Embedding",
+            )
+            main_layout.addWidget(self.editor_tabs)
         self.setLayout(main_layout)
         self.resize(1400, 800)
         self.apply_styles()
         self.update_button_visibility(False)
+
+    def add_built_embedding(self, name, embedding_store):
+        if any(not isinstance(value, dict) for value in self.embedding_data.values()):
+            QMessageBox.warning(self, "Convert library", "Convert the library to Viso JSON first.")
+            return False
+        if name in self.embedding_data:
+            QMessageBox.warning(self, "Name already used", "Choose a different embedding name.")
+            return False
+        self._save_state_for_undo()
+        self.current_file_type = "json"
+        self.embedding_data[name] = embedding_store
+        self.populate_entries()
+        self.update_button_visibility(True)
+        self.search_input.clear()
+        for entry in self.entries_widget.get_all_widgets():
+            entry.checkbox.setChecked(entry.name == name)
+        self.editor_tabs.setCurrentIndex(0)
+        return True
 
     def _create_menu(self):
         self.menu_bar = QMenuBar(self)
