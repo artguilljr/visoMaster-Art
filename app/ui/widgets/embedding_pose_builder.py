@@ -341,6 +341,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         content = QtWidgets.QHBoxLayout()
         entries = QtWidgets.QListWidget()
         entries.setIconSize(QtCore.QSize(48, 48))
+        entries.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         content.addWidget(entries)
         preview = QtWidgets.QLabel()
         preview.setFixedSize(224, 224)
@@ -351,18 +352,19 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         destination.setAccessibleName("Move selected face to pose")
         destination.addItems([candidate for candidate in POSES if candidate != pose])
         controls.addWidget(destination)
-        move = QtWidgets.QPushButton("Move to pose")
-        remove = QtWidgets.QPushButton("Remove face")
+        move = QtWidgets.QPushButton("Move selected to pose")
+        remove = QtWidgets.QPushButton("Remove selected")
         close = QtWidgets.QPushButton("Close")
         for button in (move, remove, close):
             controls.addWidget(button)
         layout.addLayout(controls)
 
-        def show_photo(index):
-            selected = 0 <= index < len(photos)
-            move.setEnabled(selected)
-            remove.setEnabled(selected)
-            if selected:
+        def show_photo():
+            index = entries.currentRow()
+            has_selection = bool(entries.selectedItems())
+            move.setEnabled(has_selection)
+            remove.setEnabled(has_selection)
+            if 0 <= index < len(photos):
                 preview.setPixmap(self.face_icon(photos[index]).pixmap(224, 224))
             else:
                 preview.clear()
@@ -374,19 +376,22 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
                     self.face_icon(photo), photo.name or photo.origin
                 ))
             entries.setCurrentRow(min(index, len(photos) - 1))
-            show_photo(entries.currentRow())
+            show_photo()
 
         def update_photo(move_to=None):
-            index = entries.currentRow()
-            if index < 0:
+            indexes = sorted(entries.row(item) for item in entries.selectedItems())
+            if not indexes:
                 return
-            photo = photos.pop(index)
+            moved = [photos[index] for index in indexes]
+            for index in reversed(indexes):
+                photos.pop(index)
             if move_to is not None:
-                self.add_pose_photos(move_to, [photo])
+                self.add_pose_photos(move_to, moved)
             self.refresh()
-            populate(index)
+            populate(indexes[0])
 
         entries.currentRowChanged.connect(show_photo)
+        entries.itemSelectionChanged.connect(show_photo)
         move.clicked.connect(lambda: update_photo(destination.currentText()))
         remove.clicked.connect(lambda: update_photo())
         close.clicked.connect(dialog.accept)
