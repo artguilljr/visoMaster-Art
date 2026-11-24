@@ -1,6 +1,6 @@
 """Build a VisoMaster embedding from a small set of aligned pose references."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from math import cos, radians, sin
 from pathlib import Path
 
@@ -13,29 +13,12 @@ SLOT_MIME = "application/x-visomaster-pose-slot"
 GALLERY_MIME = "application/x-visomaster-gallery-face"
 
 
-@dataclass
+@dataclass(eq=False)
 class PosePhoto:
     name: str
     rgb: np.ndarray
     embeddings: dict
     origin: str = ""
-    scale: int = 100
-
-    def display_rgb(self):
-        if self.scale == 100:
-            return self.rgb
-        image = image_from_rgb(self.rgb)
-        size = round(224 * self.scale / 100)
-        scaled = image.scaled(
-            size, size, QtCore.Qt.AspectRatioMode.IgnoreAspectRatio,
-            QtCore.Qt.TransformationMode.SmoothTransformation,
-        )
-        canvas = QtGui.QImage(224, 224, QtGui.QImage.Format.Format_RGB888)
-        canvas.fill(QtGui.QColor(32, 32, 32))
-        with QtGui.QPainter(canvas) as painter:
-            offset = (224 - size) // 2
-            painter.drawImage(offset, offset, scaled)
-        return aligned_rgb(canvas)
 
 
 def reduce_samples(samples, method):
@@ -84,9 +67,10 @@ def aligned_rgb(image):
 
 
 class PoseSlot(QtWidgets.QPushButton):
-    file_dropped = QtCore.Signal(str, str)
+    files_dropped = QtCore.Signal(str, list)
     slot_dropped = QtCore.Signal(str, str)
-    gallery_dropped = QtCore.Signal(str, int)
+    gallery_dropped = QtCore.Signal(str, list)
+    review_requested = QtCore.Signal(str)
 
     def __init__(self, pose):
         super().__init__(pose)
@@ -96,6 +80,10 @@ class PoseSlot(QtWidgets.QPushButton):
         self.setCheckable(True)
         self.setMinimumSize(122, 76)
         self.setIconSize(QtCore.QSize(46, 46))
+
+    def contextMenuEvent(self, event):
+        self.review_requested.emit(self.pose)
+        event.accept()
 
     def mousePressEvent(self, event):
         self.start = event.position().toPoint()
@@ -123,7 +111,7 @@ class PoseSlot(QtWidgets.QPushButton):
     def dragEnterEvent(self, event):
         mime = event.mimeData()
         if mime.hasFormat(SLOT_MIME) or mime.hasFormat(GALLERY_MIME) or (
-            len(mime.urls()) == 1 and mime.urls()[0].isLocalFile()
+            mime.hasUrls() and all(url.isLocalFile() for url in mime.urls())
         ):
             event.acceptProposedAction()
 
@@ -135,12 +123,12 @@ class PoseSlot(QtWidgets.QPushButton):
                 self.slot_dropped.emit(source, self.pose)
                 event.acceptProposedAction()
         elif mime.hasFormat(GALLERY_MIME):
-            index = bytes(mime.data(GALLERY_MIME))
-            if index.isdigit():
-                self.gallery_dropped.emit(self.pose, int(index))
+            indexes = bytes(mime.data(GALLERY_MIME)).split(b",")
+            if all(index.isdigit() for index in indexes):
+                self.gallery_dropped.emit(self.pose, [int(index) for index in indexes])
                 event.acceptProposedAction()
-        elif len(mime.urls()) == 1 and mime.urls()[0].isLocalFile():
-            self.file_dropped.emit(self.pose, mime.urls()[0].toLocalFile())
+        elif mime.hasUrls() and all(url.isLocalFile() for url in mime.urls()):
+            self.files_dropped.emit(self.pose, [url.toLocalFile() for url in mime.urls()])
             event.acceptProposedAction()
 
 
@@ -152,18 +140,19 @@ class FaceGallery(QtWidgets.QListWidget):
         self.setIconSize(QtCore.QSize(64, 64))
         self.setGridSize(QtCore.QSize(84, 82))
         self.setDragEnabled(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setMinimumHeight(118)
         self.setAccessibleName("Detected faces from folder")
 
     def startDrag(self, supported_actions):
-        item = self.currentItem()
-        if item is None:
+        items = self.selectedItems()
+        if not items:
             return
         mime = QtCore.QMimeData()
-        mime.setData(GALLERY_MIME, str(self.row(item)).encode())
+        mime.setData(GALLERY_MIME, ",".join(str(self.row(item)) for item in items).encode())
         drag = QtGui.QDrag(self)
         drag.setMimeData(mime)
-        drag.setPixmap(item.icon().pixmap(self.iconSize()))
+        drag.setPixmap(items[0].icon().pixmap(self.iconSize()))
         drag.exec(QtCore.Qt.DropAction.CopyAction)
 
 
@@ -237,7 +226,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         self.selected_pose = "Front"
         self.slots = {}
         self.gallery_photos = []
-        self.scale_gallery_index = None
+        self.combined_embedding = None
 
         layout = QtWidgets.QHBoxLayout(self)
         board = QtWidgets.QGroupBox("Pose photos")
@@ -252,16 +241,17 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.slots[pose] = slot
             self.slot_group.addButton(slot)
             slot.clicked.connect(lambda checked=False, pose=pose: self.select_pose(pose))
-            slot.file_dropped.connect(self.load_photo)
+            slot.files_dropped.connect(self.load_photos)
             slot.slot_dropped.connect(self.move_photo)
-            slot.gallery_dropped.connect(self.place_gallery_face)
+            slot.gallery_dropped.connect(self.place_gallery_faces)
+            slot.review_requested.connect(self.review_slot)
             grid.addWidget(slot, row, column)
         self.slots["Front"].setChecked(True)
         board_layout.addLayout(grid)
 
         actions = QtWidgets.QHBoxLayout()
         for caption, action in (
-            ("Choose photo", self.choose_photo),
+            ("Choose photos", self.choose_photos),
             ("Clear slot", self.clear_slot),
             ("Mirror missing side", self.mirror_side),
             ("Fill missing views", self.fill_missing),
@@ -284,24 +274,10 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
         folder_row.addWidget(self.folder_status, 1)
         gallery_layout.addLayout(folder_row)
         self.gallery = FaceGallery()
-        self.gallery.currentRowChanged.connect(self.select_gallery_face)
         self.gallery.itemDoubleClicked.connect(
-            lambda item: self.place_gallery_face(self.selected_pose, self.gallery.row(item))
+            lambda item: self.place_gallery_faces(self.selected_pose, [self.gallery.row(item)])
         )
         gallery_layout.addWidget(self.gallery)
-        scale_row = QtWidgets.QHBoxLayout()
-        self.scale_preview = QtWidgets.QLabel()
-        self.scale_preview.setFixedSize(64, 64)
-        scale_row.addWidget(self.scale_preview)
-        self.scale_label = QtWidgets.QLabel("Crop scale")
-        scale_row.addWidget(self.scale_label)
-        self.scale_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.scale_slider.setRange(50, 200)
-        self.scale_slider.setAccessibleName("Selected face crop scale")
-        self.scale_slider.setToolTip("Scale the crop in the composite preview")
-        self.scale_slider.valueChanged.connect(self.set_crop_scale)
-        scale_row.addWidget(self.scale_slider, 1)
-        gallery_layout.addLayout(scale_row)
         board_layout.addWidget(gallery_box, 1)
         layout.addWidget(board)
 
@@ -328,47 +304,94 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
 
     def select_pose(self, pose):
         self.selected_pose = pose
-        self.scale_gallery_index = None
-        self.refresh_scale()
-
-    def select_gallery_face(self, index):
-        self.scale_gallery_index = index if index >= 0 else None
-        self.refresh_scale()
-
-    def refresh_scale(self):
-        index = self.scale_gallery_index
-        photo = self.photos.get(self.selected_pose) if index is None else self.gallery_photos[index]
-        with QtCore.QSignalBlocker(self.scale_slider):
-            self.scale_slider.setEnabled(photo is not None)
-            self.scale_slider.setValue(photo.scale if photo else 100)
-        self.scale_label.setText(f"Crop scale {photo.scale}%" if photo else "Crop scale")
-        if photo:
-            self.scale_preview.setPixmap(self.face_icon(photo).pixmap(64, 64))
-        else:
-            self.scale_preview.clear()
-
-    def set_crop_scale(self, value):
-        index = self.scale_gallery_index
-        if index is None:
-            photo = self.photos.get(self.selected_pose)
-            if photo:
-                self.photos[self.selected_pose] = replace(photo, scale=value)
-        else:
-            photo = replace(self.gallery_photos[index], scale=value)
-            self.gallery_photos[index] = photo
-            self.gallery.item(index).setIcon(self.face_icon(photo))
-        self.refresh()
 
     @staticmethod
     def face_icon(photo):
-        return QtGui.QIcon(QtGui.QPixmap.fromImage(image_from_rgb(photo.display_rgb())))
+        return QtGui.QIcon(QtGui.QPixmap.fromImage(image_from_rgb(photo.rgb)))
 
-    def place_gallery_face(self, pose, index):
-        if 0 <= index < len(self.gallery_photos):
-            self.photos[pose] = self.gallery_photos[index]
-            self.slots[pose].setChecked(True)
-            self.select_pose(pose)
+    def add_pose_photos(self, pose, photos):
+        current = self.photos.setdefault(pose, [])
+        for photo in photos:
+            if photo in current:
+                continue
+            if not photo.origin:
+                current[:] = [existing for existing in current if not existing.origin]
+            current.append(photo)
+
+    def place_gallery_faces(self, pose, indexes):
+        self.add_pose_photos(
+            pose, [self.gallery_photos[index] for index in indexes
+                   if 0 <= index < len(self.gallery_photos)]
+        )
+        self.slots[pose].setChecked(True)
+        self.select_pose(pose)
+        self.refresh()
+
+    def review_slot(self, pose):
+        if self.loader is not None:
+            return
+        photos = self.photos.get(pose)
+        if not photos:
+            self.status.setText(f"{pose} has no references to review.")
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"{pose} references")
+        dialog.resize(540, 360)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        content = QtWidgets.QHBoxLayout()
+        entries = QtWidgets.QListWidget()
+        entries.setIconSize(QtCore.QSize(48, 48))
+        content.addWidget(entries)
+        preview = QtWidgets.QLabel()
+        preview.setFixedSize(224, 224)
+        content.addWidget(preview)
+        layout.addLayout(content)
+        controls = QtWidgets.QHBoxLayout()
+        destination = QtWidgets.QComboBox()
+        destination.setAccessibleName("Move selected face to pose")
+        destination.addItems([candidate for candidate in POSES if candidate != pose])
+        controls.addWidget(destination)
+        move = QtWidgets.QPushButton("Move to pose")
+        remove = QtWidgets.QPushButton("Remove face")
+        close = QtWidgets.QPushButton("Close")
+        for button in (move, remove, close):
+            controls.addWidget(button)
+        layout.addLayout(controls)
+
+        def show_photo(index):
+            selected = 0 <= index < len(photos)
+            move.setEnabled(selected)
+            remove.setEnabled(selected)
+            if selected:
+                preview.setPixmap(self.face_icon(photos[index]).pixmap(224, 224))
+            else:
+                preview.clear()
+
+        def populate(index=0):
+            entries.clear()
+            for photo in photos:
+                entries.addItem(QtWidgets.QListWidgetItem(
+                    self.face_icon(photo), photo.name or photo.origin
+                ))
+            entries.setCurrentRow(min(index, len(photos) - 1))
+            show_photo(entries.currentRow())
+
+        def update_photo(move_to=None):
+            index = entries.currentRow()
+            if index < 0:
+                return
+            photo = photos.pop(index)
+            if move_to is not None:
+                self.add_pose_photos(move_to, [photo])
             self.refresh()
+            populate(index)
+
+        entries.currentRowChanged.connect(show_photo)
+        move.clicked.connect(lambda: update_photo(destination.currentText()))
+        remove.clicked.connect(lambda: update_photo())
+        close.clicked.connect(dialog.accept)
+        populate()
+        dialog.exec()
 
     def choose_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose face photo folder")
@@ -382,15 +405,15 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             return
         self.start_photo_loader(files, folder=folder)
 
-    def choose_photo(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Choose pose photo", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"
+    def choose_photos(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Choose pose photos", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"
         )
-        if path:
-            self.load_photo(self.selected_pose, path)
+        if paths:
+            self.load_photos(self.selected_pose, paths)
 
-    def load_photo(self, pose, path):
-        self.start_photo_loader([path], pose=pose)
+    def load_photos(self, pose, paths):
+        self.start_photo_loader(paths, pose=pose)
 
     def start_photo_loader(self, files, *, pose=None, folder=None):
         if self.loader is not None:
@@ -420,14 +443,14 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.gallery_photos.clear()
             self.folder_status.setText(f"Scanning {len(files)} photos in {Path(folder).name}...")
         else:
-            self.status.setText(f"Finding a face in {Path(files[0]).name}...")
+            self.status.setText(f"Finding faces in {len(files)} selected photo(s)...")
         self.folder_button.setEnabled(False)
         self.save.setEnabled(False)
-        self.loaded_photo = None
-        self.pending_photo = pose, files[0]
+        self.loaded_photo_count = 0
+        self.pending_pose = pose
         self.loader = PosePhotoLoader(
             self.main_window, files_list=files, parent=self,
-            max_faces_per_image=0 if folder else 1,
+            max_faces_per_image=0 if folder else 1, align_preview=True,
         )
         self.loader.thumbnail_ready.connect(self.photo_loaded)
         self.loader.finished.connect(self.finish_loading, QtCore.Qt.ConnectionType.QueuedConnection)
@@ -436,20 +459,22 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
     @QtCore.Slot(str, np.ndarray, object, QtGui.QImage, str)
     def photo_loaded(self, path, _crop, embeddings, image, _face_id):
         photo = PosePhoto(Path(path).name, aligned_rgb(image), embeddings)
-        if self.pending_photo[0] is None:
+        if self.pending_pose is None:
             self.gallery_photos.append(photo)
             item = QtWidgets.QListWidgetItem(self.face_icon(photo), "")
             item.setToolTip(photo.name)
             item.setData(QtCore.Qt.ItemDataRole.AccessibleTextRole, photo.name)
             self.gallery.addItem(item)
         else:
-            self.loaded_photo = photo
+            self.loaded_photo_count += 1
+            self.add_pose_photos(self.pending_pose, [photo])
+            self.refresh()
 
     @QtCore.Slot()
     def finish_loading(self):
         if self.loader is None:
             return
-        pose, path = self.pending_photo
+        pose = self.pending_pose
         self.loader.wait()
         self.loader.deleteLater()
         self.loader = None
@@ -461,11 +486,10 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             )
             self.refresh()
             return
-        if self.loaded_photo is None:
+        if not self.loaded_photo_count:
             self.refresh()
-            self.status.setText(f"No usable face found in {Path(path).name}.")
+            self.status.setText("No usable faces found in the selected photos.")
             return
-        self.photos[pose] = self.loaded_photo
         self.slots[pose].setChecked(True)
         self.select_pose(pose)
         self.refresh()
@@ -476,23 +500,20 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             self.refresh()
 
     def move_photo(self, source, target):
-        if self.loader is not None or source == target or source not in self.photos:
+        if self.loader is not None or source == target or not self.photos.get(source):
             return
-        photo = self.photos.pop(source)
-        if target in self.photos:
-            self.photos[source] = self.photos[target]
-        self.photos[target] = photo
+        self.add_pose_photos(target, self.photos.pop(source))
         self.refresh()
 
     def mirror_side(self):
         if self.loader is not None:
             return
         for source, target in (("Turn left", "Turn right"), ("Turn right", "Turn left")):
-            photo = self.photos.get(source)
-            if photo and not photo.origin and (
-                target not in self.photos or self.photos[target].origin == "Estimated"
-            ):
-                self.photos[target] = PosePhoto(photo.name, photo.rgb[:, ::-1].copy(), {}, "Mirrored")
+            real = [photo.rgb for photo in self.photos.get(source, []) if not photo.origin]
+            existing = self.photos.get(target, [])
+            if real and all(photo.origin == "Estimated" for photo in existing):
+                rgb = np.rint(reduce_samples(real, self.method.currentText())).astype(np.uint8)
+                self.photos[target] = [PosePhoto("", rgb[:, ::-1].copy(), {}, "Mirrored")]
                 self.refresh()
                 return
         self.status.setText("Add a real side photo and leave the opposite side empty.")
@@ -500,7 +521,7 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
     def fill_missing(self):
         if self.loader is not None:
             return
-        real = [photo.rgb for photo in self.photos.values() if not photo.origin]
+        real = [photo.rgb for slot in self.photos.values() for photo in slot if not photo.origin]
         if len(real) < 2:
             self.status.setText("Add at least two real photos to estimate missing views.")
             return
@@ -512,48 +533,51 @@ class EmbeddingPoseBuilder(QtWidgets.QWidget):
             "Look down": ("Front", "Turn left", "Turn right"),
         }
         for pose, adjacent in neighbors.items():
-            if pose in self.photos:
+            if self.photos.get(pose):
                 continue
             samples = [
-                self.photos[key].rgb for key in adjacent
-                if key in self.photos and not self.photos[key].origin
+                photo.rgb for key in adjacent for photo in self.photos.get(key, [])
+                if not photo.origin
             ]
             rgb = reduce_samples(samples if len(samples) >= 2 else real, "Mean")
-            self.photos[pose] = PosePhoto("", np.rint(rgb).astype(np.uint8), {}, "Estimated")
+            self.photos[pose] = [PosePhoto("", np.rint(rgb).astype(np.uint8), {}, "Estimated")]
         self.refresh()
 
     def refresh(self):
+        method = self.method.currentText()
         for pose, slot in self.slots.items():
-            photo = self.photos.get(pose)
-            suffix = f"\n{photo.origin}" if photo and photo.origin else ""
-            slot.setText(pose + suffix)
-            slot.setToolTip(photo.name if photo else "Drop a photo here")
+            photos = self.photos.get(pose, [])
+            detail = ""
             icon = QtGui.QIcon()
-            if photo:
-                icon = self.face_icon(photo)
+            if photos:
+                detail = photos[0].origin or f"{len(photos)} photo(s)"
+                rgb = np.rint(reduce_samples([photo.rgb for photo in photos], method))
+                icon = QtGui.QIcon(QtGui.QPixmap.fromImage(image_from_rgb(rgb)))
+            slot.setText(f"{pose}\n{detail}" if detail else pose)
+            slot.setToolTip("Right-click to review or move individual faces" if photos else "Drop photos here")
             slot.setIcon(icon)
-        self.refresh_scale()
-        samples = [photo.display_rgb() for photo in self.photos.values()]
+        photos = list(dict.fromkeys(photo for slot in self.photos.values() for photo in slot))
         self.preview.image = (
-            image_from_rgb(np.rint(reduce_samples(samples, self.method.currentText())))
-            if samples else QtGui.QImage()
+            image_from_rgb(np.rint(reduce_samples([p.rgb for p in photos], method)))
+            if photos else QtGui.QImage()
         )
         self.preview.update()
+        real = [photo for photo in photos if not photo.origin]
+        self.combined_embedding = None
+        message = "Drop photos on a slot or select a slot and choose photos."
+        if real:
+            try:
+                self.combined_embedding = merge_embeddings(real, method)
+                message = f"{len(real)} real reference(s) merged. Generated views are preview only."
+            except ValueError as error:
+                message = str(error)
         if self.loader is None:
-            real_count = sum(not photo.origin for photo in self.photos.values())
-            self.save.setEnabled(real_count > 0)
-            self.status.setText(
-                f"{real_count} real reference(s). Mirrored and estimated views are preview only."
-                if samples else "Drop a photo on a slot or select a slot and choose a photo."
-            )
+            self.status.setText(message)
+        self.save.setEnabled(self.loader is None and self.combined_embedding is not None)
 
     def save_embedding(self):
-        photos = [photo for photo in self.photos.values() if not photo.origin]
-        try:
-            embeddings = merge_embeddings(photos, self.method.currentText())
-        except ValueError as error:
-            self.status.setText(str(error))
+        if self.combined_embedding is None:
             return
         name, accepted = QtWidgets.QInputDialog.getText(self, "Add Embedding", "Name")
         if accepted and name.strip():
-            self.add_embedding(name.strip(), embeddings)
+            self.add_embedding(name.strip(), self.combined_embedding)

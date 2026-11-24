@@ -11,6 +11,7 @@ import torch
 import numpy
 from PySide6 import QtCore as qtc
 from PySide6.QtGui import QImage
+from torchvision.transforms import InterpolationMode
 
 from app.helpers import miscellaneous as misc_helpers
 from app.ui.widgets.actions import common_actions as common_widget_actions
@@ -363,6 +364,7 @@ class InputFacesLoaderWorker(qtc.QThread):
         parent=None,
         *,
         max_faces_per_image=1,
+        align_preview=False,
     ):
         super().__init__(parent)
         self.main_window = main_window
@@ -370,6 +372,7 @@ class InputFacesLoaderWorker(qtc.QThread):
         self.files_list = files_list or []
         self.face_ids = face_ids or []
         self.max_faces_per_image = max_faces_per_image
+        self.align_preview = align_preview
         self._running = True  # Flag to control the running state
 
         # SNAPSHOT : get parameters in main thread before run()
@@ -503,6 +506,19 @@ class InputFacesLoaderWorker(qtc.QThread):
 
                             if face_emb is None:  # Check if recognition failed
                                 continue
+
+                            if self.align_preview:
+                                from app.processors.utils.faceutil import warp_face_by_face_landmark_5
+
+                                # Use a shared eye/nose/mouth template for the composite.
+                                aligned, _ = warp_face_by_face_landmark_5(
+                                    img,
+                                    face_kps,
+                                    image_size=224,
+                                    mode="arcface112",
+                                    interpolation=InterpolationMode.BILINEAR,
+                                )
+                                cropped_img = aligned.permute(1, 2, 0)
 
                             cropped_img_np = cropped_img.cpu().numpy()
                             # Swap channels from RGB to BGR for pixmap creation
