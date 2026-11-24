@@ -472,8 +472,26 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         self.openEditorButton.clicked.connect(self.open_embedding_editor)
         self.openEmbeddingButton.clicked.connect(
-            partial(save_load_actions.open_embeddings_from_file, self)
+            lambda checked=False: save_load_actions.open_embeddings_from_file(self)
         )
+        self.openEmbeddingButton.setToolTip("Open embedding files (replace current list)")
+        self.addEmbeddingButton = QtWidgets.QPushButton("+ Add", self.facesPanelGroupBox)
+        self.addEmbeddingButton.setToolTip("Add embedding files without clearing current identities")
+        self.addEmbeddingButton.setFlat(True)
+        self.horizontalLayout_3.insertWidget(
+            self.horizontalLayout_3.indexOf(self.openEmbeddingButton) + 1,
+            self.addEmbeddingButton,
+        )
+        self.addEmbeddingButton.clicked.connect(
+            lambda checked=False: save_load_actions.open_embeddings_from_file(
+                self, additive=True
+            )
+        )
+        self.inputEmbeddingsList.setAcceptDrops(True)
+        self.inputEmbeddingsList.viewport().setAcceptDrops(True)
+        self.inputEmbeddingsList.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DropOnly)
+        self.inputEmbeddingsList.installEventFilter(self)
+        self.inputEmbeddingsList.viewport().installEventFilter(self)
         self.saveEmbeddingButton.clicked.connect(
             partial(save_load_actions.save_embeddings_to_file, self)
         )
@@ -1066,6 +1084,27 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self._was_normal_geometry = self.geometry()
 
     def eventFilter(self, watched, event):
+        embeddings = getattr(self, "inputEmbeddingsList", None)
+        if embeddings is not None and watched in (embeddings, embeddings.viewport()):
+            if event.type() in (
+                QtCore.QEvent.Type.DragEnter,
+                QtCore.QEvent.Type.DragMove,
+                QtCore.QEvent.Type.Drop,
+            ):
+                urls = event.mimeData().urls()
+                paths = [
+                    url.toLocalFile() for url in urls
+                    if url.isLocalFile() and url.toLocalFile().lower().endswith(".json")
+                ]
+                if paths and len(paths) == len(urls):
+                    if event.type() == QtCore.QEvent.Type.Drop:
+                        if not save_load_actions.load_embedding_files(self, paths, additive=True):
+                            event.ignore()
+                            return True
+                    event.acceptProposedAction()
+                    return True
+                event.ignore()
+                return True
         viewport_widget = getattr(self, "mediaControlsViewportWidget", None)
         if (
             viewport_widget is not None

@@ -324,86 +324,99 @@ def _apply_workspace_window_state(
     return True
 
 
-def open_embeddings_from_file(main_window: "MainWindow"):
+def open_embeddings_from_file(main_window: "MainWindow", additive=False):
+    """Select one or more embedding collections, without merging identities."""
     if video_control_actions.block_if_issue_scan_active(main_window, "load embeddings"):
         return
-
-    embedding_filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+    filenames, _ = QtWidgets.QFileDialog.getOpenFileNames(
         main_window,
+        caption="Add Embeddings" if additive else "Open Embeddings (Replace)",
         filter="JSON (*.json)",
-        dir=misc_helpers.get_dir_of_file(main_window.loaded_embedding_filename),
+        dir=misc_helpers.get_dir_of_file(
+            main_window.loaded_embedding_filename
+        ),
     )
-    if embedding_filename:
-        try:
-            with open(embedding_filename, "r", encoding="utf-8") as embed_file:
-                embeddings_list = json.load(embed_file)
-                card_actions.clear_merged_embeddings(main_window)
+    if filenames:
+        load_embedding_files(main_window, filenames, additive=additive)
 
-                # Reset for each target face
-                for _, target_face in main_window.target_faces.items():
-                    target_face.assigned_merged_embeddings = {}
-                    target_face.assigned_input_embedding = {}
 
-                # Load embeddings from file and build the embedding_store dictionary
-                for embed_data in embeddings_list:
-                    embedding_store = embed_data.get("embedding_store", {})
-                    # Convert each embedding to a numpy array
-                    for recogn_model, embed in embedding_store.items():
-                        embedding_store[recogn_model] = np.array(embed)
+def load_embedding_files(main_window: "MainWindow", filenames, *, additive=True):
+    """Validate all files before changing the current collection."""
+    if not filenames or video_control_actions.block_if_issue_scan_active(
+        main_window, "load embeddings"
+    ):
+        return False
 
-                    embedding_id = str(uuid.uuid1().int)
+    records = []
+    try:
+        for filename in dict.fromkeys(filenames):
+            with open(filename, "r", encoding="utf-8") as embed_file:
+                data = json.load(embed_file)
+            if not isinstance(data, list):
+                raise ValueError(f"{filename}: expected a list of embeddings")
+            for entry in data:
+                if not isinstance(entry, dict):
+                    raise ValueError(f"{filename}: invalid embedding record")
+                name = entry.get("name")
+                store = entry.get("embedding_store")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(f"{filename}: missing embedding name")
+                if not isinstance(store, dict) or not store:
+                    raise ValueError(f"{filename}: missing embedding store for {name}")
+                arrays = {}
+                for model, value in store.items():
+                    array = np.asarray(value)
+                    if array.dtype.kind not in "fiu" or not array.size or not np.isfinite(array).all():
+                        raise ValueError(f"{filename}: invalid vector for {name}/{model}")
+                    arrays[model] = array
+                kv_path = entry.get("kv_map")
+                if kv_path is not None and not isinstance(kv_path, str):
+                    raise ValueError(f"{filename}: invalid K/V path for {name}")
+                records.append((filename, name, arrays, kv_path))
+        if not records:
+            raise ValueError("No embeddings found in the selected files.")
+    except (OSError, ValueError, TypeError, OverflowError) as exc:
+        QtWidgets.QMessageBox.critical(
+            main_window, "Error", f"Failed to load embeddings: {exc}"
+        )
+        return False
 
-                    # Pass the entire embedding_store to the function
-                    list_view_actions.create_and_add_embed_button_to_list(
-                        main_window,
-                        embed_data["name"],
-                        embedding_store,
-                        embedding_id=embedding_id,
-                    )
-
-                    # Restore KV map if it exists
-                    if embedding_id in main_window.merged_embeddings:
-                        embed_button = main_window.merged_embeddings[embedding_id]
-                        kv_map_path = embed_data.get("kv_map")
-                        if kv_map_path and os.path.exists(kv_map_path):
-                            try:
-                                payload = torch.load(
-                                    kv_map_path, map_location="cpu", weights_only=False
-                                )
-                                if isinstance(payload, dict):
-                                    # Check for new list format first, fallback to legacy dict format
-                                    if "kv_map_list" in payload:
-                                        embed_button.kv_map_list = payload[
-                                            "kv_map_list"
-                                        ]
-                                    else:
-                                        embed_button.kv_map = payload.get("kv_map")
-                                else:
-                                    embed_button.kv_map = payload
-                                print(
-                                    f"[INFO] Restored standalone K/V map for imported embedding: {embed_data['name']}"
-                                )
-                                # SELF-HEALING REGISTRY: Log this dependency on load
-                                _update_registry(
-                                    main_window,
-                                    Path(kv_map_path).name,
-                                    str(embedding_filename),
-                                    "reference_kv_data",
-                                )
-                            except Exception as e:
-                                print(
-                                    f"[ERROR] Error loading K/V map for imported embedding from {kv_map_path}: {e}"
-                                )
-
-        except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
-            QtWidgets.QMessageBox.critical(
-                main_window, "Error", f"Failed to load embeddings: {e}"
-            )
-            return
-
+    # A multi-file or additive collection must not overwrite any input file
+    # when the user subsequently clicks Save.
     main_window.loaded_embedding_filename = (
-        embedding_filename or main_window.loaded_embedding_filename
+        "" if additive or len(set(filenames)) != 1 else str(filenames[0])
     )
+    if not additive:
+        card_actions.clear_merged_embeddings(main_window)
+
+    for filename, name, store, kv_path in records:
+        embedding_id = str(uuid.uuid4().int)
+        list_view_actions.create_and_add_embed_button_to_list(
+            main_window, name, store, embedding_id=embedding_id
+        )
+        button = main_window.merged_embeddings[embedding_id]
+        if kv_path and os.path.exists(kv_path):
+            try:
+                # Embedding JSON may point to an untrusted serialized file.
+                # Never execute arbitrary pickle payloads on import.
+                payload = torch.load(kv_path, map_location="cpu", weights_only=True)
+                if isinstance(payload, dict):
+                    if "kv_map_list" in payload:
+                        button.kv_map_list = payload["kv_map_list"]
+                    else:
+                        button.kv_map = payload.get("kv_map")
+                else:
+                    button.kv_map = payload
+                _update_registry(
+                    main_window, Path(kv_path).name, str(filename), "reference_kv_data"
+                )
+            except Exception as exc:
+                print(f"[WARN] Skipped K/V map for {name}: {exc}")
+
+    if hasattr(main_window, "video_processor") and main_window.video_processor:
+        main_window.video_processor.ui_state_is_dirty = True
+    filter_actions.filter_merged_embeddings(main_window)
+    return True
 
 
 def save_embeddings_to_file(main_window: "MainWindow", save_as=False):
